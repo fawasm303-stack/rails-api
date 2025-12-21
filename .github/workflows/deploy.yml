@@ -1,0 +1,204 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: me-central-1
+  TF_DIR: infra
+
+  # Update these if your names differ
+  PROJECT_NAME: rails-api
+  ECR_REPO_NAME: rails-api
+  ECS_CLUSTER_NAME: rails-api-cluster
+  ECS_SERVICE_NAME: rails-api-svc
+
+jobs:
+  build_and_push:
+    name:  Build
+    runs-on: ubuntu-latest
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_uri: ${{ steps.meta.outputs.image_uri }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # OIDC auth to AWS (no keys)
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          IMAGE_TAG="${GITHUB_SHA}"
+          IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}:${IMAGE_TAG}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Amazon ECR
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin \
+              "$(echo '${{ steps.meta.outputs.image_uri }}' | cut -d/ -f1)"
+
+      - name: Ensure ECR repo exists (first run safe)
+        run: |
+          set -euo pipefail
+          aws ecr describe-repositories --repository-names "$ECR_REPO_NAME" --region "$AWS_REGION" >/dev/null 2>&1 \
+            || aws ecr create-repository --repository-name "$ECR_REPO_NAME" --region "$AWS_REGION" >/dev/null
+
+      - name: Build & push image
+        run: |
+          set -euo pipefail
+          docker build -t "${{ steps.meta.outputs.image_uri }}" .
+          docker push "${{ steps.meta.outputs.image_uri }}"
+
+  terraform_applme-central-1y:
+    name: 2) Terraform Plan & Apply
+    needs: build_and_push
+    runs-on: ubuntu-latest
+
+    outputs:
+      health_url: ${{ steps.out.outputs.health_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # OIDC auth again (each job needs it)
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.6"
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -input=false
+
+      - name: Terraform plan
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform plan -input=false \
+            -var="aws_region=${AWS_REGION}" \
+            -var="image_tag=${{ needs.build_and_push.outputs.image_tag }}"
+
+      - name: Terraform apply
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform apply -auto-approve -input=false \
+            -var="aws_region=${AWS_REGION}" \
+            -var="image_tag=${{ needs.build_and_push.outputs.image_tag }}"
+
+      - name: Read health URL output
+        id: out
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          set -euo pipefail
+          HEALTH_URL="$(terraform output -raw health_url)"
+          echo "health_url=${HEALTH_URL}" >> "$GITHUB_OUTPUT"
+          echo "Health URL: ${HEALTH_URL}"
+
+  deploy_ecs:
+    name: 3) Deploy to ECS (force new deployment)
+    needs: terraform_apply
+    runs-on: ubuntu-latest
+
+    steps:
+      # OIDC auth
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Force new deployment
+        run: |
+          set -euo pipefail
+          aws ecs update-service \
+            --cluster "${ECS_CLUSTER_NAME}" \
+            --service "${ECS_SERVICE_NAME}" \
+            --force-new-deployment \
+            --region "${AWS_REGION}" >/dev/null
+
+      - name: Wait for service stable
+        run: |
+          set -euo pipefail
+          aws ecs wait services-stable \
+            --cluster "${ECS_CLUSTER_NAME}" \
+            --services "${ECS_SERVICE_NAME}" \
+            --region "${AWS_REGION}"
+
+  verify:
+    name: 4) Post-Deploy Verification
+    needs: [terraform_apply, deploy_ecs]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Verify /health returns {"status":"ok"}
+        run: |
+          set -euo pipefail
+          URL="${{ needs.terraform_apply.outputs.health_url }}"
+          echo "Checking: ${URL}"
+
+          for i in {1..20}; do
+            BODY="$(curl -fsS "${URL}" || true)"
+            if echo "${BODY}" | jq -e '.status == "ok"' >/dev/null 2>&1; then
+              echo "OK: ${BODY}"
+              exit 0
+            fi
+            echo "Attempt $i failed: ${BODY}"
+            sleep 5
+          done
+
+          echo "FAILED health check"
+          exit 1
+
+  notify:
+    name: Slack Notification
+    if: always()
+    needs: [build_and_push, terraform_apply, deploy_ecs, verify]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Send Slack message
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          STATUS="${{ needs.verify.result }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SHA="${{ github.sha }}"
+          HEALTH_URL="${{ needs.terraform_apply.outputs.health_url }}"
+          IMAGE_URI="${{ needs.build_and_push.outputs.image_uri }}"
+
+          MSG="*Deploy ${STATUS}*\nSHA: ${SHA}\nImage: ${IMAGE_URI}\nHealth: ${HEALTH_URL}\nRun: ${RUN_URL}"
+
+          curl -X POST -H "Content-type: application/json" \
+            --data "$(jq -n --arg text "${MSG}" '{text: $text}')" \
+            "${SLACK_WEBHOOK_URL}"
+
