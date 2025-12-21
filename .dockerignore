@@ -43,3 +43,20 @@
 # Ignore Docker-related files
 /.dockerignore
 /Dockerfile*
+
+.git
+.github
+infra
+log
+tmp
+storage
+test
+spec
+coverage
+node_modules
+vendor/bundle
+.DS_Store
+
+*.log
+*.sqlite3
+*.pid

@@ -36,24 +36,18 @@ jobs:
         run: |
           set -euo pipefail
 
-          # ---------------------------
-          # Image tag (short SHA)
-          # ---------------------------
+          # Image tag 
           COMMIT_HASH="$(echo "${GITHUB_SHA}" | cut -c 1-7)"
           IMAGE_TAG="${COMMIT_HASH:=latest}"
           echo "IMAGE_TAG=${IMAGE_TAG}"
 
-          # ---------------------------
           # Terraform
-          # ---------------------------
           cd "${TF_DIR}"
           terraform init
-          terraform plan -out=tfplan -var="aws_region=${AWS_REGION}" -var="image_tag=${IMAGE_TAG}"
-          terraform apply tfplan
+          terraform plan -out=tfplan 
+          terraform apply -auto-approve tfplan
 
-          # ---------------------------
           # Read outputs
-          # ---------------------------
           ECS_CLUSTER="$(terraform output -raw ecs_cluster)"
           ECS_SERVICE="$(terraform output -raw ecs_service)"
           ECR_REPO_URL="$(terraform output -raw ecr_repo)"
@@ -69,32 +63,18 @@ jobs:
 
           cd ..
 
-          # ---------------------------
           # Build & Push image
-          # ---------------------------
-          aws ecr get-login-password --region "${AWS_REGION}" \
-            | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+          aws ecr get-login-password --region "${AWS_REGION}" docker login --username AWS --password-stdin "${ECR_REGISTRY}"
 
           docker build -t "${IMAGE_URI}" .
           docker push "${IMAGE_URI}"
 
-          # ---------------------------
           # Force ECS deployment
-          # ---------------------------
-          aws ecs update-service \
-            --cluster "${ECS_CLUSTER}" \
-            --service "${ECS_SERVICE}" \
-            --force-new-deployment \
-            --region "${AWS_REGION}" >/dev/null
+          aws ecs update-service --cluster "${ECS_CLUSTER}" --service "${ECS_SERVICE}"--force-new-deployment --region "${AWS_REGION}" >/dev/null
 
-          aws ecs wait services-stable \
-            --cluster "${ECS_CLUSTER}" \
-            --services "${ECS_SERVICE}" \
-            --region "${AWS_REGION}"
+          aws ecs wait services-stable --cluster "${ECS_CLUSTER}" --services "${ECS_SERVICE}" --region "${AWS_REGION}"
 
-          # ---------------------------
-          # Health check (HTTP 200 is success)
-          # ---------------------------
+          # Health check
           OK=0
           for i in {1..20}; do
             CODE="$(curl -sS -o /dev/null -w "%{http_code}" "${HEALTH_URL}" || true)"
@@ -112,9 +92,7 @@ jobs:
             exit 1
           fi
 
-          # ---------------------------
-          # Slack notification (optional) - multiline
-          # ---------------------------
+          # Slack notification 
           if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
             # ensure jq exists (most self-hosted runners have it; install if missing)
             if ! command -v jq >/dev/null 2>&1; then
