@@ -44,7 +44,7 @@ jobs:
           # Terraform
           cd "${TF_DIR}"
           terraform init
-          terraform plan -out=tfplan 
+          terraform plan -out=tfplan -var="aws_region=${AWS_REGION}" -var="image_tag=${IMAGE_TAG}"
           terraform apply -auto-approve tfplan
 
           # Read outputs
