@@ -17,7 +17,6 @@ resource "aws_lb_target_group" "ecs" {
   tags = local.tags
 }
 
-# Forward all requests to the TG (root owns TG)
 resource "aws_lb_listener_rule" "forward_to_ecs" {
   listener_arn = module.alb.listener_http_arn
   priority     = 100

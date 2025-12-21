@@ -3,7 +3,7 @@ resource "aws_security_group" "alb" {
   vpc_id = var.vpc_id
 
   ingress {
-    description = "HTTP from internet"
+    description = "anywhere"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
@@ -11,7 +11,7 @@ resource "aws_security_group" "alb" {
   }
 
   egress {
-    description = "All outbound"
+    description = "outbound"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
@@ -30,8 +30,7 @@ resource "aws_lb" "new-alb" {
   tags = var.tags
 }
 
-# Listener exists but doesn't forward to TG (TG is created in root)
-# Default action is a fixed response. Root will attach a listener rule to forward to TG.
+
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.new-alb.arn
   port              = 80

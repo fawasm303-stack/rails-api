@@ -4,7 +4,6 @@ resource "aws_ecs_cluster" "cluster" {
   tags = var.tags
 }
 
-# Reusable execution role (good default for most ECS services)
 resource "aws_iam_role" "ecs_exec" {
   name = "${var.name}-ecs-exec"
 
@@ -25,7 +24,6 @@ resource "aws_iam_role_policy_attachment" "ecs_exec" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# CloudWatch log group for ECS containers
 resource "aws_cloudwatch_log_group" "ecs" {
   name              = "/ecs/${var.name}"
   retention_in_days = 7
