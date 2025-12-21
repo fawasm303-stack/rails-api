@@ -1,4 +1,4 @@
-name: CI/CD - Deploy
+name: Deploy to AWS ECS
 
 on:
   push:
@@ -7,10 +7,6 @@ on:
 permissions:
   id-token: write
   contents: read
-
-concurrency:
-  group: deploy-main
-  cancel-in-progress: true
 
 env:
   AWS_REGION: me-central-1
@@ -21,178 +17,97 @@ jobs:
     runs-on: self-hosted
 
     steps:
-      # -----------------------
-      # Stage 0: Checkout
-      # -----------------------
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # -----------------------
-      # Stage 1: AWS Auth (OIDC)
-      # -----------------------
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Ensure jq installed
-        run: |
-          set -e
-          if ! command -v jq >/dev/null 2>&1; then
-            sudo apt-get update && sudo apt-get install -y jq
-          fi
-
-      # -----------------------
-      # Stage 2: Compute image tag (short SHA like CodeBuild)
-      # -----------------------
-      - name: Compute image tag (short commit hash)
-        id: tag
-        run: |
-          set -euo pipefail
-          COMMIT_HASH="$(echo "${GITHUB_SHA}" | cut -c 1-7)"
-          IMAGE_TAG="${COMMIT_HASH:=latest}"
-          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
-          echo "IMAGE_TAG=${IMAGE_TAG}"
-
-      # -----------------------
-      # Stage 3: Terraform Plan & Apply
-      # - creates ECR repo
-      # - updates task definition image tag (var.image_tag)
-      # -----------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.14.2"
 
-      - name: Terraform init
-        working-directory: ${{ env.TF_DIR }}
-        run: terraform init -input=false
-
-      - name: Terraform plan
-        working-directory: ${{ env.TF_DIR }}
-        run: |
-          terraform plan -input=false \
-            -var="aws_region=${AWS_REGION}" \
-            -var="image_tag=${{ steps.tag.outputs.image_tag }}"
-
-      - name: Terraform apply
-        working-directory: ${{ env.TF_DIR }}
-        run: |
-          terraform apply -auto-approve -input=false \
-            -var="aws_region=${AWS_REGION}" \
-            -var="image_tag=${{ steps.tag.outputs.image_tag }}"
-
-      # -----------------------
-      # Stage 4: Read Terraform outputs (cluster/service/ecr/health)
-      # -----------------------
-      - name: Read Terraform outputs
-        id: tfout
-        working-directory: ${{ env.TF_DIR }}
-        run: |
-          set -euo pipefail
-
-          ECS_CLUSTER="$(terraform output -raw ecs_cluster)"
-          ECS_SERVICE="$(terraform output -raw ecs_service)"
-          ECR_REPO_URL="$(terraform output -raw ecr_repo)"
-          HEALTH_URL="$(terraform output -raw health_url)"
-
-          # ecr_repo output is full repository url; we tag with our SHA
-          IMAGE_URI="${ECR_REPO_URL}:${{ steps.tag.outputs.image_tag }}"
-
-          echo "ecs_cluster=${ECS_CLUSTER}" >> "$GITHUB_OUTPUT"
-          echo "ecs_service=${ECS_SERVICE}" >> "$GITHUB_OUTPUT"
-          echo "ecr_repo_url=${ECR_REPO_URL}" >> "$GITHUB_OUTPUT"
-          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
-          echo "health_url=${HEALTH_URL}" >> "$GITHUB_OUTPUT"
-
-          echo "ECS_CLUSTER=${ECS_CLUSTER}"
-          echo "ECS_SERVICE=${ECS_SERVICE}"
-          echo "ECR_REPO_URL=${ECR_REPO_URL}"
-          echo "IMAGE_URI=${IMAGE_URI}"
-          echo "HEALTH_URL=${HEALTH_URL}"
-
-      # -----------------------
-      # Stage 5: Build & Push Docker Image (after ECR repo exists)
-      # -----------------------
-      - name: Login to ECR
-        run: |
-          set -euo pipefail
-          # registry = first part before the first slash
-          ECR_REGISTRY="$(echo "${{ steps.tfout.outputs.ecr_repo_url }}" | cut -d/ -f1)"
-
-          aws ecr get-login-password --region "${AWS_REGION}" \
-            | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
-
-      - name: Build & push image
-        run: |
-          set -euo pipefail
-          docker build -t "${{ steps.tfout.outputs.image_uri }}" .
-          docker push "${{ steps.tfout.outputs.image_uri }}"
-
-      # -----------------------
-      # Stage 6: Deploy to ECS (force new deployment) + wait
-      # -----------------------
-      - name: Force new deployment
-        run: |
-          set -euo pipefail
-          aws ecs update-service \
-            --cluster "${{ steps.tfout.outputs.ecs_cluster }}" \
-            --service "${{ steps.tfout.outputs.ecs_service }}" \
-            --force-new-deployment \
-            --region "${AWS_REGION}" >/dev/null
-
-      - name: Wait for ECS service stable
-        run: |
-          set -euo pipefail
-          aws ecs wait services-stable \
-            --cluster "${{ steps.tfout.outputs.ecs_cluster }}" \
-            --services "${{ steps.tfout.outputs.ecs_service }}" \
-            --region "${AWS_REGION}"
-
-      # -----------------------
-      # Stage 7: Post-deploy verification
-      # -----------------------
-      - name: Verify /health returns {"status":"ok"}
-        run: |
-          set -euo pipefail
-          URL="${{ steps.tfout.outputs.health_url }}"
-          echo "Checking: ${URL}"
-
-          for i in {1..20}; do
-            BODY="$(curl -fsS "${URL}" || true)"
-            if echo "${BODY}" | jq -e '.status == "ok"' >/dev/null 2>&1; then
-              echo "OK: ${BODY}"
-              exit 0
-            fi
-            echo "Attempt $i failed: ${BODY}"
-            sleep 5
-          done
-
-          echo "FAILED health check"
-          exit 1
-
-      # -----------------------
-      # Stage 8: Slack notify (optional)
-      # -----------------------
-      - name: Slack notify
-        if: always()
+      - name: Terraform → Build → Deploy → Verify
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           set -euo pipefail
 
-          STATUS="${{ job.status }}"
-          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # ---------------------------
+          # Image tag (short SHA)
+          # ---------------------------
+          COMMIT_HASH="$(echo "${GITHUB_SHA}" | cut -c 1-7)"
+          IMAGE_TAG="${COMMIT_HASH:=latest}"
+          echo "IMAGE_TAG=${IMAGE_TAG}"
 
-          MSG="*Deploy ${STATUS}*\nRegion: ${AWS_REGION}\nSHA: ${{ github.sha }}\nImage: ${{ steps.tfout.outputs.image_uri }}\nHealth: ${{ steps.tfout.outputs.health_url }}\nRun: ${RUN_URL}"
+          # ---------------------------
+          # Terraform
+          # ---------------------------
+          cd "${TF_DIR}"
+          terraform init
+          terraform plan -out=tfplan 
+          terraform apply -auto-approve tfplan
 
-          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
-            echo "No SLACK_WEBHOOK_URL set. Skipping Slack."
-            exit 0
-          fi
+          # ---------------------------
+          # Read outputs
+          # ---------------------------
+          ECS_CLUSTER="$(terraform output -raw ecs_cluster)"
+          ECS_SERVICE="$(terraform output -raw ecs_service)"
+          ECR_REPO_URL="$(terraform output -raw ecr_repo)"
+          HEALTH_URL="$(terraform output -raw health_url)"
 
-          curl -X POST -H "Content-type: application/json" \
-            --data "$(jq -n --arg text "${MSG}" '{text: $text}')" \
-            "${SLACK_WEBHOOK_URL}"
+          IMAGE_URI="${ECR_REPO_URL}:${IMAGE_TAG}"
+          ECR_REGISTRY="$(echo "${ECR_REPO_URL}" | cut -d/ -f1)"
 
+          echo "ECS_CLUSTER=${ECS_CLUSTER}"
+          echo "ECS_SERVICE=${ECS_SERVICE}"
+          echo "IMAGE_URI=${IMAGE_URI}"
+          echo "HEALTH_URL=${HEALTH_URL}"
+
+          cd ..
+
+          # ---------------------------
+          # Build & Push image
+          # ---------------------------
+          aws ecr get-login-password --region "${AWS_REGION}" docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+          docker build -t "${IMAGE_URI}" .
+          docker push "${IMAGE_URI}"
+
+          # ---------------------------
+          # Force ECS deployment
+          # ---------------------------
+          aws ecs update-service --cluster "${ECS_CLUSTER}" --service "${ECS_SERVICE}" --force-new-deployment --region "${AWS_REGION}" >/dev/null
+
+          aws ecs wait services-stable --cluster "${ECS_CLUSTER}"  --services "${ECS_SERVICE}" --region "${AWS_REGION}"
+
+# Health check
+    
+for i in {1..20}; do
+HTTP_CODE="$(curl -s -o /dev/null -w "%{http_code}" "${HEALTH_URL}" || true)"
+echo "Attempt $i: HTTP ${HTTP_CODE}"
+if [ "${HTTP_CODE}" = "200" ]; then
+echo "Health check OK"
+break
+fi
+sleep 5
+  [ "$i" -eq 20 ] && echo "Health check FAILED" && exit 1
+done
+
+# Slack notification (optional)
+
+if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+  MSG=$(cat <<EOF
+*Deployment Success*
+Commit ID: ${GITHUB_SHA}
+Health URL: ${HEALTH_URL}
+EOF
+)
+
+  curl -X POST -H "Content-type: application/json" \
+    --data "$(jq -n --arg text "${MSG}" '{text: $text}')" \
+    "${SLACK_WEBHOOK_URL}" >/dev/null || true
+fi
