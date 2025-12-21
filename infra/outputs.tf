@@ -13,3 +13,7 @@ output "ecs_cluster" {
 output "ecr_repo" {
   value = aws_ecr_repository.app.repository_url
 }
+
+output "ecs_service" {
+  value = aws_ecs_service.app.name
+}
