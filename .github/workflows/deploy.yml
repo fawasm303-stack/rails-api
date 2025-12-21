@@ -70,7 +70,7 @@ jobs:
           docker push "${IMAGE_URI}"
 
           # Force ECS deployment
-          aws ecs update-service --cluster "${ECS_CLUSTER}" --service "${ECS_SERVICE}"--force-new-deployment --region "${AWS_REGION}" >/dev/null
+          aws ecs update-service --cluster "${ECS_CLUSTER}" --service "${ECS_SERVICE}" --force-new-deployment --region "${AWS_REGION}" >/dev/null
 
           aws ecs wait services-stable --cluster "${ECS_CLUSTER}" --services "${ECS_SERVICE}" --region "${AWS_REGION}"
 
