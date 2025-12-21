@@ -74,7 +74,7 @@ jobs:
 
           aws ecs wait services-stable --cluster "${ECS_CLUSTER}" --services "${ECS_SERVICE}" --region "${AWS_REGION}"
 
-          # Health check
+          # Health_check
           OK=0
           for i in {1..20}; do
             CODE="$(curl -sS -o /dev/null -w "%{http_code}" "${HEALTH_URL}" || true)"
