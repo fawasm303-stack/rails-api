@@ -48,8 +48,8 @@ jobs:
           # ---------------------------
           cd "${TF_DIR}"
           terraform init
-          terraform plan -out=tfplan 
-          terraform apply -auto-approve tfplan
+          terraform plan -out=tfplan -var="aws_region=${AWS_REGION}" -var="image_tag=${IMAGE_TAG}"
+          terraform apply tfplan
 
           # ---------------------------
           # Read outputs
@@ -72,7 +72,8 @@ jobs:
           # ---------------------------
           # Build & Push image
           # ---------------------------
-          aws ecr get-login-password --region "${AWS_REGION}" docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+          aws ecr get-login-password --region "${AWS_REGION}" \
+            | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
 
           docker build -t "${IMAGE_URI}" .
           docker push "${IMAGE_URI}"
@@ -80,34 +81,49 @@ jobs:
           # ---------------------------
           # Force ECS deployment
           # ---------------------------
-          aws ecs update-service --cluster "${ECS_CLUSTER}" --service "${ECS_SERVICE}" --force-new-deployment --region "${AWS_REGION}" >/dev/null
+          aws ecs update-service \
+            --cluster "${ECS_CLUSTER}" \
+            --service "${ECS_SERVICE}" \
+            --force-new-deployment \
+            --region "${AWS_REGION}" >/dev/null
 
-          aws ecs wait services-stable --cluster "${ECS_CLUSTER}"  --services "${ECS_SERVICE}" --region "${AWS_REGION}"
+          aws ecs wait services-stable \
+            --cluster "${ECS_CLUSTER}" \
+            --services "${ECS_SERVICE}" \
+            --region "${AWS_REGION}"
 
-# Health check
-    
-for i in {1..20}; do
-HTTP_CODE="$(curl -s -o /dev/null -w "%{http_code}" "${HEALTH_URL}" || true)"
-echo "Attempt $i: HTTP ${HTTP_CODE}"
-if [ "${HTTP_CODE}" = "200" ]; then
-echo "Health check OK"
-break
-fi
-sleep 5
-  [ "$i" -eq 20 ] && echo "Health check FAILED" && exit 1
-done
+          # ---------------------------
+          # Health check (HTTP 200 is success)
+          # ---------------------------
+          OK=0
+          for i in {1..20}; do
+            CODE="$(curl -sS -o /dev/null -w "%{http_code}" "${HEALTH_URL}" || true)"
+            echo "Attempt $i: HTTP ${CODE}"
+            if [ "${CODE}" = "200" ]; then
+              echo "Health OK"
+              OK=1
+              break
+            fi
+            sleep 5
+          done
 
-# Slack notification (optional)
+          if [ "${OK}" -ne 1 ]; then
+            echo "Health check FAILED"
+            exit 1
+          fi
 
-if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
-  MSG=$(cat <<EOF
-*Deployment Success*
+          # ---------------------------
+          # Slack notification (optional) - multiline
+          # ---------------------------
+          if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+            MSG=$(cat <<EOF
+Deployment Success
 Commit ID: ${GITHUB_SHA}
-Health URL: ${HEALTH_URL}
+URL: ${HEALTH_URL}
 EOF
 )
+            curl -X POST -H "Content-type: application/json" \
+              --data "$(printf '%s' "{\"text\":\"${MSG}\"}")" \
+              "${SLACK_WEBHOOK_URL}" >/dev/null || true
+          fi
 
-  curl -X POST -H "Content-type: application/json" \
-    --data "$(jq -n --arg text "${MSG}" '{text: $text}')" \
-    "${SLACK_WEBHOOK_URL}" >/dev/null || true
-fi
