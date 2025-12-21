@@ -17,7 +17,7 @@ env:
   TF_DIR: infra
 
   # Update if your names differ
-  ECR_REPO_NAME: rails-api
+  ECR_REPO_NAME: rails-api-fp
   ECS_CLUSTER_NAME: rails-api-cluster
   ECS_SERVICE_NAME: rails-api-svc
 
