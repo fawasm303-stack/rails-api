@@ -116,14 +116,14 @@ jobs:
           # Slack notification (optional) - multiline
           # ---------------------------
           if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
-            MSG=$(cat <<EOF
-Deployment Success
-Commit ID: ${GITHUB_SHA}
-URL: ${HEALTH_URL}
-EOF
-)
+            # ensure jq exists (most self-hosted runners have it; install if missing)
+            if ! command -v jq >/dev/null 2>&1; then
+              sudo apt-get update && sudo apt-get install -y jq
+            fi
+
+            MSG=$'Deployment Success\nCommit ID: '"${GITHUB_SHA}"$'\nURL: '"${HEALTH_URL}"
             curl -X POST -H "Content-type: application/json" \
-              --data "$(printf '%s' "{\"text\":\"${MSG}\"}")" \
+              --data "$(jq -n --arg text "${MSG}" '{text: $text}')" \
               "${SLACK_WEBHOOK_URL}" >/dev/null || true
           fi
 
