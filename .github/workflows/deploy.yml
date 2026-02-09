@@ -92,7 +92,7 @@ jobs:
             exit 1
           fi
 
-          # Slack notification 
+          # Slack notification
           if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
             # ensure jq exists (most self-hosted runners have it; install if missing)
             if ! command -v jq >/dev/null 2>&1; then
